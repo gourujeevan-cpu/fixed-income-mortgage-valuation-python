@@ -1,0 +1,833 @@
+"""
+
+Candidate Numbers: 67125 and 70216
+
+FM405 Summative Work - Part (f): Prepayment Modelling [Final Fixed Version]
+============================================================================
+Two prepayment factors:
+  1. Exogenous prepayment (turnover): borrowers prepay for non-financial
+     reasons at a rate that ramps with mortgage age (PSA-style).
+  2. Suboptimal exercise (refinancing friction): borrowers who are
+     in-the-money exercise with a probability that depends on moneyness.
+
+Methodological note:
+  - The benchmark uses tree-optimal prepayment from backward induction.
+  - The full model is a reduced-form behavioral model estimated off the
+    no-prepayment mortgage value V^np and outstanding balance L.
+  - Confidence intervals follow the FM405 lecture-note convention:
+      estimate ± 2 × standard error.
+"""
+
+import numpy as np
+from scipy.optimize import brentq
+import matplotlib.pyplot as plt
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 1: INPUTS                                                      ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+DATA_SOURCE = "Bank of England, UK Gilt Zero-Coupon Yield Curve"
+DATA_DATE = "30 January 2026"
+COMPOUNDING = "continuously_compounded"
+
+YIELDS_PERCENT = [
+    3.48, 3.55, 3.59, 3.63, 3.67, 3.72, 3.78, 3.84, 3.90, 3.97,
+    4.04, 4.11, 4.18, 4.25, 4.31, 4.38, 4.45, 4.51, 4.57, 4.63
+]
+
+DELTA = 0.5
+SIGMA_BDT = 0.20
+F0 = 100000
+SPREAD_BP = 50
+
+N_SIM = 100000
+N_SIM_SEARCH = 20000
+
+# Factor 1: exogenous turnover
+CPR_MAX = 0.06
+RAMP_PERIODS = 6
+
+# Factor 2: refinancing friction
+KAPPA = 15.0
+M0 = 0.02
+
+SENSITIVITY = {
+    "cpr_max": [0.03, 0.06, 0.09],
+    "ramp_periods": [3, 6, 9],
+    "kappa": [7.5, 15.0, 22.5],
+    "m0": [0.01, 0.02, 0.03],
+}
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  PART (a) CALIBRATION (silent)                                          ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def process_inputs(yp, delta, comp):
+    y = np.array(yp) / 100.0
+    n = len(y)
+    mat = np.arange(1, n + 1) * delta
+    if comp == "continuously_compounded":
+        ycc = y
+    elif comp == "semi_annually_compounded":
+        ycc = 2.0 * np.log(1.0 + y / 2.0)
+    elif comp == "annually_compounded":
+        ycc = np.log(1.0 + y)
+    else:
+        raise ValueError(comp)
+    return mat, ycc, 100.0 * np.exp(-ycc * mat), ycc[0], n
+
+
+def calibrate_bdt(r0, zcb, sigma, delta, n):
+    sd = np.sqrt(delta)
+    zt = [None] * n
+    rt = [None] * n
+    zt[0] = np.array([np.log(r0)])
+    rt[0] = np.array([r0])
+    th = np.zeros(n - 1)
+
+    for i in range(n - 1):
+        tgt = zcb[i + 1]
+
+        def err(t, _i=i):
+            nz = np.zeros(_i + 2)
+            for j in range(_i + 1):
+                nz[j] = zt[_i][j] + t * delta + sigma * sd
+            nz[_i + 1] = zt[_i][_i] + t * delta - sigma * sd
+            nr = np.exp(nz)
+
+            v = np.exp(-nr * delta) * 100.0
+            for s in range(_i, -1, -1):
+                vn = np.zeros(s + 1)
+                for j in range(s + 1):
+                    vn[j] = np.exp(-rt[s][j] * delta) * (0.5 * v[j] + 0.5 * v[j + 1])
+                v = vn
+            return v[0] - tgt
+
+        th[i] = brentq(err, -50.0, 50.0, xtol=1e-14)
+
+        nz = np.zeros(i + 2)
+        for j in range(i + 1):
+            nz[j] = zt[i][j] + th[i] * delta + sigma * sd
+        nz[i + 1] = zt[i][i] + th[i] * delta - sigma * sd
+        zt[i + 1] = nz
+        rt[i + 1] = np.exp(nz)
+
+    return rt, zt, th
+
+
+def print_tree_with_theta(r_tree, theta, label, delta):
+    """
+    Full tree display used across the FM405 scripts.
+    The display includes the maturity date column i=20 (T=10.0), which is blank because
+    the calibrated short-rate tree ends at i=19 (t=9.5).
+    """
+    n_rate_cols = len(r_tree)
+    n_display_cols = n_rate_cols + 1
+    col_w = 8
+
+    print(f"\n  {label} (rates in %):")
+    row_t = "  T      " + "".join(f"{i * delta:>{col_w}.1f}" for i in range(n_display_cols))
+    row_i = "  i      " + "".join(f"{i:>{col_w}d}" for i in range(n_display_cols))
+
+    theta_cells = []
+    for i in range(n_display_cols):
+        if i < len(theta):
+            theta_cells.append(f"{theta[i] * 100:>{col_w}.4f}")
+        else:
+            theta_cells.append(" " * col_w)
+    row_th = "  θ_i×100" + "".join(theta_cells)
+
+    print(row_t)
+    print(row_i)
+    print(row_th)
+    print("  " + "-" * (8 + col_w * n_display_cols))
+
+    for j in range(n_display_cols):
+        row = f"  j={j:<4d} "
+        for i in range(n_display_cols):
+            if i < n_rate_cols and r_tree[i] is not None and j <= i:
+                row += f"{r_tree[i][j] * 100:>{col_w}.2f}"
+            else:
+                row += " " * col_w
+        print(row)
+
+
+maturities, yields_cc, zcb_prices, r0, n_steps = process_inputs(
+    YIELDS_PERCENT, DELTA, COMPOUNDING
+)
+T = n_steps * DELTA
+bdt_r_tree, bdt_z_tree, bdt_theta = calibrate_bdt(
+    r0, zcb_prices, SIGMA_BDT, DELTA, n_steps
+)
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  MORTGAGE HELPERS                                                       ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def mortgage_coupon(F0, rm_sa, n_pay):
+    r = rm_sa / 2.0
+    if r < 1e-12:
+        return F0 / n_pay
+    return F0 * r * (1.0 + r) ** n_pay / ((1.0 + r) ** n_pay - 1.0)
+
+
+def amort_schedule(F0, C, rm_sa, n_pay):
+    r = rm_sa / 2.0
+    L = np.zeros(n_pay + 1)
+    L[0] = F0
+    interest = np.zeros(n_pay)
+    principal = np.zeros(n_pay)
+    for i in range(n_pay):
+        interest[i] = r * L[i]
+        principal[i] = C - interest[i]
+        L[i + 1] = L[i] - principal[i]
+    return L, interest, principal
+
+
+def build_vnp_tree(r_tree, delta, n_pay, C):
+    vnp = [None] * (n_pay + 1)
+    vnp[n_pay] = np.zeros(n_pay + 1)
+    for i in range(n_pay - 1, -1, -1):
+        vnp[i] = np.zeros(i + 1)
+        for j in range(i + 1):
+            vnp[i][j] = np.exp(-r_tree[i][j] * delta) * (
+                0.5 * vnp[i + 1][j] + 0.5 * vnp[i + 1][j + 1] + C
+            )
+    return vnp
+
+
+def build_mortgage_tree(r_tree, delta, n_pay, C, L):
+    vm = [None] * (n_pay + 1)
+    prepay = [None] * (n_pay + 1)
+    vm[n_pay] = np.zeros(n_pay + 1)
+    prepay[n_pay] = np.zeros(n_pay + 1, dtype=bool)
+
+    for i in range(n_pay - 1, -1, -1):
+        vm[i] = np.zeros(i + 1)
+        prepay[i] = np.zeros(i + 1, dtype=bool)
+        for j in range(i + 1):
+            cont = np.exp(-r_tree[i][j] * delta) * (
+                0.5 * vm[i + 1][j] + 0.5 * vm[i + 1][j + 1] + C
+            )
+            if i == 0:
+                vm[i][j] = cont
+            else:
+                vm[i][j] = min(cont, L[i])
+                prepay[i][j] = L[i] < cont
+
+    return vm, prepay
+
+
+def value_mortgage_optimal(r_tree, delta, n_pay, F0, rm_sa):
+    C = mortgage_coupon(F0, rm_sa, n_pay)
+    L, interest, princ = amort_schedule(F0, C, rm_sa, n_pay)
+    vnp = build_vnp_tree(r_tree, delta, n_pay, C)
+    vm, prepay = build_mortgage_tree(r_tree, delta, n_pay, C, L)
+    return vm[0][0], vnp[0][0], vnp[0][0] - vm[0][0], C, L, interest, princ, vnp, vm, prepay
+
+
+def find_par_rate(r_tree, delta, n_pay, F0):
+    def err(rm):
+        return value_mortgage_optimal(r_tree, delta, n_pay, F0, rm)[0] - F0
+    return brentq(err, 0.01, 0.20, xtol=1e-10)
+
+
+rm_BDT = find_par_rate(bdt_r_tree, DELTA, n_steps, F0)
+res_tree = value_mortgage_optimal(bdt_r_tree, DELTA, n_steps, F0, rm_BDT)
+C_BDT = res_tree[3]
+L_BDT = res_tree[4]
+princ_BDT = res_tree[6]
+Vnp_tree = res_tree[7]
+prepay_tree = res_tree[9]
+
+print("=" * 70)
+print("  PART (f): PREPAYMENT MODELLING")
+print("=" * 70)
+print(f"  BDT par mortgage rate (from Part b): {rm_BDT*100:.4f}%")
+print(f"  Coupon C = {C_BDT:,.2f}")
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  PREPAYMENT MODEL                                                       ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def exogenous_smm(i, cpr_max, ramp_periods):
+    if i <= 0:
+        cpr = 0.0
+    elif i <= ramp_periods:
+        cpr = cpr_max * (i / ramp_periods)
+    else:
+        cpr = cpr_max
+    return 1.0 - (1.0 - cpr) ** 0.5
+
+
+def exercise_probability(vnp_ij, L_i, kappa, m0):
+    if L_i < 1e-12:
+        return 0.0
+    m = (vnp_ij - L_i) / L_i
+    if m <= m0:
+        return 0.0
+    return 1.0 - np.exp(-kappa * (m - m0))
+
+
+def exercise_probability_from_m(m, kappa, m0):
+    if m <= m0:
+        return 0.0
+    return 1.0 - np.exp(-kappa * (m - m0))
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  MONTE CARLO FUNCTIONS                                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _mc_stats(v):
+    mn = np.mean(v)
+    se = np.std(v, ddof=1) / np.sqrt(len(v))
+    return mn, se, mn - 2.0 * se, mn + 2.0 * se
+
+
+def mc_optimal_benchmark(r0, theta, sigma, delta, n_pay, F0, rm_sa,
+                         prepay_flags, n_sim, rm_pt=None, seed=42):
+    """
+    Exact tree-consistent benchmark:
+    uses tree-computed optimal prepay flags from backward induction.
+    """
+    rng = np.random.RandomState(seed)
+    sd = np.sqrt(delta)
+
+    C = mortgage_coupon(F0, rm_sa, n_pay)
+    L, _, princ_m = amort_schedule(F0, C, rm_sa, n_pay)
+
+    compute_mbs = rm_pt is not None
+    if compute_mbs:
+        int_pt = np.array([(rm_pt / 2.0) * L[i] for i in range(n_pay)])
+
+    mort_vals = np.zeros(n_sim)
+    pt_vals = np.zeros(n_sim) if compute_mbs else None
+    io_vals = np.zeros(n_sim) if compute_mbs else None
+    po_vals = np.zeros(n_sim) if compute_mbs else None
+
+    for s in range(n_sim):
+        z = np.log(r0)
+        j = 0
+        cum_rd = 0.0
+        mv = 0.0
+        ptv = 0.0
+        iov = 0.0
+        pov = 0.0
+
+        for i in range(n_pay):
+            if i > 0 and prepay_flags[i][j]:
+                disc = np.exp(-cum_rd)
+                mv += disc * L[i]
+                if compute_mbs:
+                    ptv += disc * L[i]
+                    pov += disc * L[i]
+                break
+
+            r_i = np.exp(z)
+            cum_rd += r_i * delta
+            disc_end = np.exp(-cum_rd)
+
+            mv += disc_end * C
+            if compute_mbs:
+                ptv += disc_end * (int_pt[i] + princ_m[i])
+                iov += disc_end * int_pt[i]
+                pov += disc_end * princ_m[i]
+
+            if i < n_pay - 1:
+                down = rng.randint(0, 2)
+                z = z + theta[i] * delta + sigma * sd * (1 - 2 * down)
+                j += down
+
+        mort_vals[s] = mv
+        if compute_mbs:
+            pt_vals[s] = ptv
+            io_vals[s] = iov
+            po_vals[s] = pov
+
+    result = {"mortgage": _mc_stats(mort_vals)}
+    if compute_mbs:
+        result["PT"] = _mc_stats(pt_vals)
+        result["IO"] = _mc_stats(io_vals)
+        result["PO"] = _mc_stats(po_vals)
+    return result
+
+
+def mc_exog_plus_optimal(r0, theta, sigma, delta, n_pay, F0, rm_sa,
+                         prepay_flags, n_sim, cpr_max, ramp_periods,
+                         rm_pt=None, seed=42):
+    """
+    Comparison benchmark only:
+    tree-optimal exercise plus exogenous turnover.
+    This is not the same structural model as the reduced-form full model.
+    """
+    rng = np.random.RandomState(seed)
+    sd = np.sqrt(delta)
+
+    C = mortgage_coupon(F0, rm_sa, n_pay)
+    L, _, princ_m = amort_schedule(F0, C, rm_sa, n_pay)
+
+    compute_mbs = rm_pt is not None
+    if compute_mbs:
+        int_pt = np.array([(rm_pt / 2.0) * L[i] for i in range(n_pay)])
+
+    mort_vals = np.zeros(n_sim)
+    pt_vals = np.zeros(n_sim) if compute_mbs else None
+    io_vals = np.zeros(n_sim) if compute_mbs else None
+    po_vals = np.zeros(n_sim) if compute_mbs else None
+
+    for s in range(n_sim):
+        z = np.log(r0)
+        j = 0
+        cum_rd = 0.0
+        mv = 0.0
+        ptv = 0.0
+        iov = 0.0
+        pov = 0.0
+
+        for i in range(n_pay):
+            if i > 0:
+                p_exog = exogenous_smm(i, cpr_max, ramp_periods)
+                prepay_now = prepay_flags[i][j] or (rng.random() < p_exog)
+                if prepay_now:
+                    disc = np.exp(-cum_rd)
+                    mv += disc * L[i]
+                    if compute_mbs:
+                        ptv += disc * L[i]
+                        pov += disc * L[i]
+                    break
+
+            r_i = np.exp(z)
+            cum_rd += r_i * delta
+            disc_end = np.exp(-cum_rd)
+
+            mv += disc_end * C
+            if compute_mbs:
+                ptv += disc_end * (int_pt[i] + princ_m[i])
+                iov += disc_end * int_pt[i]
+                pov += disc_end * princ_m[i]
+
+            if i < n_pay - 1:
+                down = rng.randint(0, 2)
+                z = z + theta[i] * delta + sigma * sd * (1 - 2 * down)
+                j += down
+
+        mort_vals[s] = mv
+        if compute_mbs:
+            pt_vals[s] = ptv
+            io_vals[s] = iov
+            po_vals[s] = pov
+
+    result = {"mortgage": _mc_stats(mort_vals)}
+    if compute_mbs:
+        result["PT"] = _mc_stats(pt_vals)
+        result["IO"] = _mc_stats(io_vals)
+        result["PO"] = _mc_stats(po_vals)
+    return result
+
+
+def mc_prepayment_model(r0, theta, sigma, delta, n_pay, F0, rm_sa,
+                        r_tree, n_sim, cpr_max, ramp_periods, kappa, m0,
+                        rm_pt=None, seed=42):
+    """
+    Reduced-form two-factor model:
+      - exogenous turnover
+      - behavioral refinancing based on V^np moneyness
+
+    The refinancing incentive is proxied by:
+      m = (V^np_{i,j} - L_i) / L_i
+    where V^np is the no-prepayment mortgage value on the calibrated tree.
+    """
+    rng = np.random.RandomState(seed)
+    sd = np.sqrt(delta)
+
+    C = mortgage_coupon(F0, rm_sa, n_pay)
+    L, _, princ_m = amort_schedule(F0, C, rm_sa, n_pay)
+    vnp = build_vnp_tree(r_tree, delta, n_pay, C)
+
+    compute_mbs = rm_pt is not None
+    if compute_mbs:
+        int_pt = np.array([(rm_pt / 2.0) * L[i] for i in range(n_pay)])
+
+    mort_vals = np.zeros(n_sim)
+    pt_vals = np.zeros(n_sim) if compute_mbs else None
+    io_vals = np.zeros(n_sim) if compute_mbs else None
+    po_vals = np.zeros(n_sim) if compute_mbs else None
+
+    for s in range(n_sim):
+        z = np.log(r0)
+        j = 0
+        cum_rd = 0.0
+        mv = 0.0
+        ptv = 0.0
+        iov = 0.0
+        pov = 0.0
+
+        for i in range(n_pay):
+            r_i = np.exp(z)
+            js = min(j, i)
+
+            if i > 0:
+                p_exog = exogenous_smm(i, cpr_max, ramp_periods)
+                p_exercise = exercise_probability(vnp[i][js], L[i], kappa, m0)
+                p_total = 1.0 - (1.0 - p_exog) * (1.0 - p_exercise)
+
+                if rng.random() < p_total:
+                    disc = np.exp(-cum_rd)
+                    mv += disc * L[i]
+                    if compute_mbs:
+                        ptv += disc * L[i]
+                        pov += disc * L[i]
+                    break
+
+            cum_rd += r_i * delta
+            disc_end = np.exp(-cum_rd)
+            mv += disc_end * C
+
+            if compute_mbs:
+                ptv += disc_end * (int_pt[i] + princ_m[i])
+                iov += disc_end * int_pt[i]
+                pov += disc_end * princ_m[i]
+
+            if i < n_pay - 1:
+                down = rng.randint(0, 2)
+                z = z + theta[i] * delta + sigma * sd * (1 - 2 * down)
+                j += down
+
+        mort_vals[s] = mv
+        if compute_mbs:
+            pt_vals[s] = ptv
+            io_vals[s] = iov
+            po_vals[s] = pov
+
+    result = {"mortgage": _mc_stats(mort_vals)}
+    if compute_mbs:
+        result["PT"] = _mc_stats(pt_vals)
+        result["IO"] = _mc_stats(io_vals)
+        result["PO"] = _mc_stats(po_vals)
+    return result
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  DESCRIPTION                                                            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print(f"""
+  ─────────────────────────────────────────────────────────
+  (i) ECONOMIC MECHANISMS
+  ─────────────────────────────────────────────────────────
+
+  Factor 1: EXOGENOUS PREPAYMENT (TURNOVER)
+    Borrowers prepay for non-financial reasons such as house sale,
+    relocation, divorce or inheritance.
+
+    Annual CPR ramps from 0% to {CPR_MAX*100:.0f}% over {RAMP_PERIODS*DELTA:.1f} years,
+    then stays flat.
+
+  Factor 2: SUBOPTIMAL EXERCISE (REFINANCING FRICTION)
+    In-the-money borrowers prepay with probability:
+      p(m) = max(0, 1 - exp(-κ·(m - m₀)))
+    where κ = {KAPPA:.1f} and m₀ = {M0*100:.1f}%.
+
+  Combined prepayment probability:
+    p_total = 1 - (1 - p_exog)·(1 - p_exercise)
+
+  Benchmark note:
+    The tree-consistent benchmark below uses optimal prepay flags from
+    backward induction, matching Part (e).
+    The full model instead uses a reduced-form behavioral exercise rule
+    based on moneyness m = (V^np - L) / L.
+""")
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  BASE CASE                                                              ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("  ─────────────────────────────────────────────────────────")
+print("  (ii)-(iii) BASE CASE RESULTS")
+print("  ─────────────────────────────────────────────────────────")
+
+sp = SPREAD_BP / 10000.0
+rm_pt_BDT = rm_BDT - sp
+
+res_optimal = mc_optimal_benchmark(
+    r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_BDT,
+    prepay_tree, N_SIM, rm_pt=rm_pt_BDT, seed=42
+)
+
+res_model = mc_prepayment_model(
+    r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_BDT,
+    bdt_r_tree, N_SIM,
+    cpr_max=CPR_MAX, ramp_periods=RAMP_PERIODS,
+    kappa=KAPPA, m0=M0,
+    rm_pt=rm_pt_BDT, seed=42
+)
+
+
+def print_result(label, res):
+    m = res["mortgage"]
+    print(f"\n  {label}:")
+    print(f"    Mortgage:  {m[0]:>10,.2f}  [{m[2]:,.0f}, {m[3]:,.0f}]")
+    if "PT" in res:
+        pt = res["PT"]
+        io = res["IO"]
+        po = res["PO"]
+        print(f"    PT:        {pt[0]:>10,.2f}  [{pt[2]:,.0f}, {pt[3]:,.0f}]")
+        print(f"    IO:        {io[0]:>10,.2f}  [{io[2]:,.0f}, {io[3]:,.0f}]")
+        print(f"    PO:        {po[0]:>10,.2f}  [{po[2]:,.0f}, {po[3]:,.0f}]")
+
+
+print_result("Tree-optimal benchmark", res_optimal)
+print_result("Prepayment model (base case)", res_model)
+
+m_opt = res_optimal["mortgage"][0]
+m_mod = res_model["mortgage"][0]
+print(f"\n  Mortgage value change: {m_mod - m_opt:+,.2f} ({(m_mod / m_opt - 1) * 100:+.2f}%)")
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  ADJUSTED MORTGAGE RATE                                                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("\n  --- Adjusted mortgage rate ---")
+print("  This calibration is simulation-based and therefore approximate.")
+
+def err_adj(rm):
+    res = mc_prepayment_model(
+        r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm,
+        bdt_r_tree, N_SIM_SEARCH,
+        cpr_max=CPR_MAX, ramp_periods=RAMP_PERIODS,
+        kappa=KAPPA, m0=M0,
+        seed=42
+    )
+    return res["mortgage"][0] - F0
+
+
+print("  Scanning for adjusted rate...")
+rms_scan = np.arange(0.03, 0.12, 0.005)
+vs_scan = []
+
+for rm in rms_scan:
+    res_tmp = mc_prepayment_model(
+        r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm,
+        bdt_r_tree, N_SIM_SEARCH,
+        cpr_max=CPR_MAX, ramp_periods=RAMP_PERIODS,
+        kappa=KAPPA, m0=M0,
+        seed=42
+    )
+    vs_scan.append(res_tmp["mortgage"][0])
+
+vs_scan = np.array(vs_scan)
+idx = np.where((vs_scan[:-1] < F0) & (vs_scan[1:] >= F0))[0]
+if len(idx) == 0:
+    idx = np.where((vs_scan[:-1] > F0) & (vs_scan[1:] <= F0))[0]
+
+if len(idx) > 0:
+    rm_adj = brentq(err_adj, rms_scan[idx[0]], rms_scan[idx[0] + 1], xtol=1e-6)
+else:
+    ic = np.argmin(np.abs(vs_scan - F0))
+    rm_adj = rms_scan[ic]
+    print(f"  Warning: no exact bracket. Using closest grid value: {rm_adj*100:.2f}%")
+
+print(f"\n  Original BDT par rate:  {rm_BDT*100:.4f}%")
+print(f"  Adjusted par rate:      {rm_adj*100:.4f}%")
+print(f"  Change:                 {(rm_adj-rm_BDT)*10000:+.1f} bp")
+
+res_adj = mc_prepayment_model(
+    r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_adj,
+    bdt_r_tree, N_SIM,
+    cpr_max=CPR_MAX, ramp_periods=RAMP_PERIODS,
+    kappa=KAPPA, m0=M0,
+    rm_pt=rm_adj - sp, seed=42
+)
+print_result("MBS at adjusted rate", res_adj)
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SENSITIVITY ANALYSIS                                                   ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("\n\n  ─────────────────────────────────────────────────────────")
+print("  (iv) SENSITIVITY ANALYSIS")
+print("  ─────────────────────────────────────────────────────────")
+
+base = {
+    "cpr_max": CPR_MAX,
+    "ramp_periods": RAMP_PERIODS,
+    "kappa": KAPPA,
+    "m0": M0,
+}
+
+sens_results = {}
+
+for param, values in SENSITIVITY.items():
+    print(f"\n  --- Varying {param} ---")
+    print(f"    {'Value':>10} {'Mortgage':>12} {'PT':>12} {'IO':>12} {'PO':>12}")
+    print(f"    {'-'*60}")
+
+    for val in values:
+        kwargs = base.copy()
+        kwargs[param] = val
+
+        res = mc_prepayment_model(
+            r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_BDT,
+            bdt_r_tree, N_SIM,
+            cpr_max=kwargs["cpr_max"],
+            ramp_periods=kwargs["ramp_periods"],
+            kappa=kwargs["kappa"],
+            m0=kwargs["m0"],
+            rm_pt=rm_pt_BDT, seed=42
+        )
+
+        m = res["mortgage"][0]
+        pt = res["PT"][0]
+        io = res["IO"][0]
+        po = res["PO"][0]
+        tag = " (base)" if val == base[param] else ""
+
+        if param == "ramp_periods":
+            val_str = f"{int(val):>10d}"
+        else:
+            val_str = f"{val:>10.3f}"
+
+        print(f"    {val_str} {m:>12,.2f} {pt:>12,.2f} {io:>12,.2f} {po:>12,.2f}{tag}")
+        sens_results[(param, val)] = res
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  PLOTS                                                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+for idx_plot, (param, values) in enumerate(SENSITIVITY.items()):
+    ax = axes[idx_plot // 2, idx_plot % 2]
+    mort_v = [sens_results[(param, v)]["mortgage"][0] for v in values]
+    pt_v = [sens_results[(param, v)]["PT"][0] for v in values]
+    io_v = [sens_results[(param, v)]["IO"][0] for v in values]
+    po_v = [sens_results[(param, v)]["PO"][0] for v in values]
+
+    x = np.arange(len(values))
+    w = 0.2
+    ax.bar(x - 1.5 * w, mort_v, w, label="Mortgage", color="steelblue", alpha=0.8)
+    ax.bar(x - 0.5 * w, pt_v, w, label="PT", color="darkorange", alpha=0.8)
+    ax.bar(x + 0.5 * w, io_v, w, label="IO", color="green", alpha=0.8)
+    ax.bar(x + 1.5 * w, po_v, w, label="PO", color="red", alpha=0.8)
+
+    ax.set_xticks(x)
+    if param == "ramp_periods":
+        ax.set_xticklabels([f"{int(v)}" for v in values])
+    else:
+        ax.set_xticklabels([f"{v:.3f}" for v in values])
+    ax.set_xlabel(param)
+    ax.set_ylabel("Value")
+    ax.set_title(f"Sensitivity to {param}")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("fig_f_sensitivity.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+ages = np.arange(0, n_steps)
+sprs = [exogenous_smm(i, CPR_MAX, RAMP_PERIODS) * 100 for i in ages]
+axes[0].plot(ages * DELTA, sprs, "b-o", ms=4)
+axes[0].set_xlabel("Mortgage Age (years)")
+axes[0].set_ylabel("Semi-annual Prepay Prob (%)")
+axes[0].set_title("Factor 1: Exogenous Turnover Rate")
+axes[0].grid(True, alpha=0.3)
+
+m_range = np.linspace(-0.05, 0.15, 200)
+for k in SENSITIVITY["kappa"]:
+    p = [exercise_probability_from_m(m, k, M0) for m in m_range]
+    axes[1].plot(m_range * 100, p, label=f"κ={k:.1f}")
+axes[1].axvline(M0 * 100, color="grey", ls="--", lw=1, label=f"m₀={M0*100:.0f}%")
+axes[1].set_xlabel("Moneyness (%)")
+axes[1].set_ylabel("Exercise Probability")
+axes[1].set_title("Factor 2: Refinancing Friction")
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("fig_f_prepayment_functions.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  FACTOR DECOMPOSITION                                                   ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("\n\n  ─────────────────────────────────────────────────────────")
+print("  FACTOR DECOMPOSITION: Effect of Each Factor Separately")
+print("  ─────────────────────────────────────────────────────────")
+
+res_exog_opt = mc_exog_plus_optimal(
+    r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_BDT,
+    prepay_tree, N_SIM,
+    cpr_max=CPR_MAX, ramp_periods=RAMP_PERIODS,
+    rm_pt=rm_pt_BDT, seed=42
+)
+
+res_fric_only = mc_prepayment_model(
+    r0, bdt_theta, SIGMA_BDT, DELTA, n_steps, F0, rm_BDT,
+    bdt_r_tree, N_SIM,
+    cpr_max=0.0, ramp_periods=1,
+    kappa=KAPPA, m0=M0,
+    rm_pt=rm_pt_BDT, seed=42
+)
+
+print(f"\n  {'Model':>34} {'Mortgage':>12} {'PT':>12} {'IO':>12} {'PO':>12}")
+print(f"  {'-'*76}")
+for label, res in [
+    ("Tree-optimal benchmark", res_optimal),
+    ("Exogenous + optimal exercise", res_exog_opt),
+    ("Refinancing friction only", res_fric_only),
+    ("Both factors (full model)", res_model),
+]:
+    m = res["mortgage"][0]
+    pt = res["PT"][0]
+    io = res["IO"][0]
+    po = res["PO"][0]
+    print(f"  {label:>34} {m:>12,.2f} {pt:>12,.2f} {io:>12,.2f} {po:>12,.2f}")
+
+print("""
+  Interpretation:
+    - Exogenous turnover creates prepayment even when borrowers would not
+      refinance for rate reasons alone.
+    - Refinancing friction lowers the exercise probability of in-the-money
+      borrowers relative to fully optimal exercise.
+    - The full two-factor model combines both effects and is more realistic
+      than pure optimal exercise, but remains a reduced-form specification.
+""")
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SUMMARY                                                                ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+print("=" * 70)
+print("  PART (f) SUMMARY")
+print("=" * 70)
+
+print(f"""
+  Prepayment Model:
+    Factor 1: Exogenous turnover (CPR_max={CPR_MAX*100:.0f}%, ramp={RAMP_PERIODS*DELTA:.1f}yr)
+    Factor 2: Refinancing friction (κ={KAPPA:.1f}, m₀={M0*100:.1f}%)
+
+  Original BDT par rate:     {rm_BDT*100:.4f}%
+  Adjusted par rate:         {rm_adj*100:.4f}% ({(rm_adj-rm_BDT)*10000:+.1f} bp)
+
+  Mortgage value (base):     {res_model['mortgage'][0]:,.2f}  CI: [{res_model['mortgage'][2]:,.0f}, {res_model['mortgage'][3]:,.0f}]
+  PT value (adjusted rate):  {res_adj['PT'][0]:,.2f}  CI: [{res_adj['PT'][2]:,.0f}, {res_adj['PT'][3]:,.0f}]
+  IO value (adjusted rate):  {res_adj['IO'][0]:,.2f}  CI: [{res_adj['IO'][2]:,.0f}, {res_adj['IO'][3]:,.0f}]
+  PO value (adjusted rate):  {res_adj['PO'][0]:,.2f}  CI: [{res_adj['PO'][2]:,.0f}, {res_adj['PO'][3]:,.0f}]
+""")
+
+print("  PART (f) COMPLETE ✓")
