@@ -15,10 +15,10 @@ The project values a fixed-rate mortgage with an embedded prepayment option usin
 
 ## Files
 
-- `fm405_part_a.py` — constructs and calibrates Ho-Lee and BDT interest rate trees
-- `fm405_parts_b_to_e.py` — mortgage valuation, MBS valuation, and Monte Carlo simulation
-- `fm405_part_f.py` — behavioural prepayment model and sensitivity analysis
-- `report.pdf` — full project write-up
+- constructs and calibrates Ho-Lee and BDT interest rate trees
+- mortgage valuation, MBS valuation, and Monte Carlo simulation
+- behavioural prepayment model and sensitivity analysis
+-  full project write-up
 
 ## Tools used
 
