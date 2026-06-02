@@ -1,0 +1,432 @@
+"""
+
+Candidate Numbers: 67125 and 70216
+
+FM405 Summative Work - Part (a): Constructing Interest Rate Trees
+=================================================================
+Ho-Lee and Black-Derman-Toy (BDT) Calibration
+
+HOW TO USE THIS CODE:
+    1. Edit SECTION 1 below to change yield curve data, volatilities, or step size
+    2. Run the entire script
+    3. All outputs (trees, plots, verification) update automatically
+"""
+
+import numpy as np
+from scipy.optimize import brentq
+from scipy.special import comb
+import matplotlib.pyplot as plt
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 1: USER INPUTS — EDIT HERE                                     ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+# --- 1A. Yield Curve Data ---
+# Source: Bank of England, UK Government Bond (Gilt) Zero-Coupon Yield Curve
+# Date:   30 January 2026
+# Convention: Continuously compounded
+# Maturities: 0.5, 1.0, 1.5, ..., 10.0 years (20 semi-annual points)
+
+DATA_SOURCE = "Bank of England, UK Gilt Zero-Coupon Yield Curve"
+DATA_DATE = "30 January 2026"
+COMPOUNDING = "continuously_compounded"  # Options:
+# "continuously_compounded"
+# "semi_annually_compounded"
+# "annually_compounded"
+
+YIELDS_PERCENT = [
+    3.48, 3.55, 3.59, 3.63, 3.67, 3.72, 3.78, 3.84, 3.90, 3.97,
+    4.04, 4.11, 4.18, 4.25, 4.31, 4.38, 4.45, 4.51, 4.57, 4.63
+]
+
+# --- 1B. Model Parameters ---
+DELTA = 0.5  # Time step in years (semi-annual)
+
+# Ho-Lee: volatility of the LEVEL of short rates (annualized)
+SIGMA_HL = 0.0185  # 1.85%
+
+# BDT: volatility of LOG short rates (annualized)
+SIGMA_BDT = 0.20   # 20.00%
+
+# --- 1C. Display Options ---
+MAX_TREE_DISPLAY_COLS = 11
+SAVE_PLOTS = True
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 2: DATA PROCESSING                                             ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def process_inputs(yields_pct, delta, compounding):
+    """
+    Convert user-provided yields into continuously compounded yields
+    and zero-coupon bond prices (per 100 face value).
+    """
+    yields_raw = np.array(yields_pct) / 100.0
+    n_steps = len(yields_raw)
+    maturities = np.arange(1, n_steps + 1) * delta
+
+    if compounding == "continuously_compounded":
+        yields_cc = yields_raw
+    elif compounding == "semi_annually_compounded":
+        yields_cc = 2.0 * np.log(1.0 + yields_raw / 2.0)
+    elif compounding == "annually_compounded":
+        yields_cc = np.log(1.0 + yields_raw)
+    else:
+        raise ValueError(f"Unknown compounding convention: {compounding}")
+
+    zcb_prices = 100.0 * np.exp(-yields_cc * maturities)
+
+    # With first maturity at 0.5 years and delta = 0.5, using the first
+    # zero rate as the initial short rate is a standard approximation.
+    r0 = yields_cc[0]
+
+    return maturities, yields_cc, zcb_prices, r0, n_steps
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 3: MODEL CALIBRATION FUNCTIONS                                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def calibrate_ho_lee(r0, zcb_prices, sigma, delta, n_steps):
+    """
+    Calibrate Ho-Lee binomial interest rate tree.
+
+    Model dynamics (continuously compounded short rate):
+        r_{i+1,j}   = r_{i,j} + theta_i * delta + sigma * sqrt(delta)   [up]
+        r_{i+1,j+1} = r_{i,j} + theta_i * delta - sigma * sqrt(delta)   [down]
+        Risk-neutral probability q = 1/2
+
+    Calibration: theta_i chosen so tree-implied price of ZCB maturing
+    at step (i+2) matches the market price.
+    """
+    sqrt_dt = np.sqrt(delta)
+    n_theta = n_steps - 1
+
+    r_tree = [None] * n_steps
+    r_tree[0] = np.array([r0])
+    theta = np.zeros(n_theta)
+
+    for i in range(n_theta):
+        target = zcb_prices[i + 1]
+
+        def pricing_error(th, _i=i):
+            nr = np.zeros(_i + 2)
+            for j in range(_i + 1):
+                nr[j] = r_tree[_i][j] + th * delta + sigma * sqrt_dt
+            nr[_i + 1] = r_tree[_i][_i] + th * delta - sigma * sqrt_dt
+
+            V = np.exp(-nr * delta) * 100.0
+            for s in range(_i, -1, -1):
+                V_new = np.zeros(s + 1)
+                for j in range(s + 1):
+                    V_new[j] = np.exp(-r_tree[s][j] * delta) * (
+                        0.5 * V[j] + 0.5 * V[j + 1]
+                    )
+                V = V_new
+            return V[0] - target
+
+        theta[i] = brentq(pricing_error, -5.0, 5.0, xtol=1e-14)
+
+        nr = np.zeros(i + 2)
+        for j in range(i + 1):
+            nr[j] = r_tree[i][j] + theta[i] * delta + sigma * sqrt_dt
+        nr[i + 1] = r_tree[i][i] + theta[i] * delta - sigma * sqrt_dt
+        r_tree[i + 1] = nr
+
+    return r_tree, theta
+
+
+def calibrate_bdt(r0, zcb_prices, sigma, delta, n_steps):
+    """
+    Calibrate Simple Black-Derman-Toy binomial interest rate tree.
+
+    Model dynamics (in log-rates z = ln(r)):
+        z_{i+1,j}   = z_{i,j} + theta_i * delta + sigma * sqrt(delta)   [up]
+        z_{i+1,j+1} = z_{i,j} + theta_i * delta - sigma * sqrt(delta)   [down]
+        r_{i,j} = exp(z_{i,j})  =>  rates are always positive
+        Risk-neutral probability q = 1/2
+    """
+    sqrt_dt = np.sqrt(delta)
+    n_theta = n_steps - 1
+
+    z_tree = [None] * n_steps
+    r_tree = [None] * n_steps
+    z_tree[0] = np.array([np.log(r0)])
+    r_tree[0] = np.array([r0])
+    theta = np.zeros(n_theta)
+
+    for i in range(n_theta):
+        target = zcb_prices[i + 1]
+
+        def pricing_error(th, _i=i):
+            nz = np.zeros(_i + 2)
+            for j in range(_i + 1):
+                nz[j] = z_tree[_i][j] + th * delta + sigma * sqrt_dt
+            nz[_i + 1] = z_tree[_i][_i] + th * delta - sigma * sqrt_dt
+            nr = np.exp(nz)
+
+            V = np.exp(-nr * delta) * 100.0
+            for s in range(_i, -1, -1):
+                V_new = np.zeros(s + 1)
+                for j in range(s + 1):
+                    V_new[j] = np.exp(-r_tree[s][j] * delta) * (
+                        0.5 * V[j] + 0.5 * V[j + 1]
+                    )
+                V = V_new
+            return V[0] - target
+
+        theta[i] = brentq(pricing_error, -50.0, 50.0, xtol=1e-14)
+
+        nz = np.zeros(i + 2)
+        for j in range(i + 1):
+            nz[j] = z_tree[i][j] + theta[i] * delta + sigma * sqrt_dt
+        nz[i + 1] = z_tree[i][i] + theta[i] * delta - sigma * sqrt_dt
+        z_tree[i + 1] = nz
+        r_tree[i + 1] = np.exp(nz)
+
+    return r_tree, z_tree, theta
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 4: VERIFICATION & UTILITY FUNCTIONS                            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def price_zcb(r_tree, delta, maturity_step):
+    """Price a ZCB maturing at maturity_step via backward induction (per 100)."""
+    V = np.ones(maturity_step + 1) * 100.0
+    for s in range(maturity_step - 1, -1, -1):
+        V_new = np.zeros(s + 1)
+        for j in range(s + 1):
+            V_new[j] = np.exp(-r_tree[s][j] * delta) * (0.5 * V[j] + 0.5 * V[j + 1])
+        V = V_new
+    return V[0]
+
+
+def verify_calibration(r_tree, zcb_prices, delta, maturities, label):
+    """Reprice all ZCBs from tree and report errors."""
+    n = len(zcb_prices)
+    print(f"\n  {'Maturity':>8}  {'Market':>12}  {'Tree':>12}  {'Error':>12}")
+    print(f"  {'-' * 48}")
+    max_err = 0.0
+    for k in range(n):
+        tree_p = price_zcb(r_tree, delta, k + 1)
+        err = tree_p - zcb_prices[k]
+        max_err = max(max_err, abs(err))
+        print(
+            f"  {maturities[k]:>8.1f}  {zcb_prices[k]:>12.6f}  "
+            f"{tree_p:>12.6f}  {err:>12.2e}"
+        )
+    print(f"  Max absolute error: {max_err:.2e}")
+    return max_err
+
+
+def print_tree_with_theta(r_tree, theta, label, delta):
+    """
+    Print the full tree in the requested layout:
+      - Row 1: time T = 0.0, 0.5, ..., 10.0
+      - Row 2: period i = 0, 1, ..., 20
+      - Row 3: theta_i * 100 for calibrated drifts
+      - Rows j=0 through j=20: rates in %
+
+    The calibrated short-rate tree ends at i=19 (t=9.5). The final display column i=20
+    corresponds to the maturity date T=10.0 and is left blank for both theta and rates.
+    """
+    n_rate_cols = len(r_tree)
+    n_display_cols = n_rate_cols + 1
+    col_w = 8
+
+    print(f"\n  {label} (rates in %):")
+    row_t = "  T      " + "".join(f"{i * delta:>{col_w}.1f}" for i in range(n_display_cols))
+    row_i = "  i      " + "".join(f"{i:>{col_w}d}" for i in range(n_display_cols))
+
+    theta_cells = []
+    for i in range(n_display_cols):
+        if i < len(theta):
+            theta_cells.append(f"{theta[i] * 100:>{col_w}.4f}")
+        else:
+            theta_cells.append(" " * col_w)
+    row_th = "  θ_i×100" + "".join(theta_cells)
+
+    print(row_t)
+    print(row_i)
+    print(row_th)
+    print("  " + "-" * (8 + col_w * n_display_cols))
+
+    for j in range(n_display_cols):
+        row = f"  j={j:<4d} "
+        for i in range(n_display_cols):
+            if i < n_rate_cols and r_tree[i] is not None and j <= i:
+                row += f"{r_tree[i][j] * 100:>{col_w}.2f}"
+            else:
+                row += " " * col_w
+        print(row)
+    print("  Note: the displayed maturity column i=20 (T=10.0) is the final payment date.")
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 5: PLOTTING FUNCTIONS                                          ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def plot_all(maturities, yields_cc, hl_tree, bdt_r_tree,
+             hl_theta, bdt_theta, delta, n_steps, save=True):
+    """Generate all figures for the write-up."""
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # (a) Input yield curve
+    ax = axes[0, 0]
+    ax.plot(maturities, yields_cc * 100, "bo-", ms=4)
+    ax.set_xlabel("Maturity (years)")
+    ax.set_ylabel("Yield (%)")
+    ax.set_title(f"Zero-Coupon Yield Curve ({DATA_DATE})")
+    ax.grid(True, alpha=0.3)
+
+    # (b) Calibrated theta
+    ax = axes[0, 1]
+    t_ax = np.arange(len(hl_theta)) * delta
+    w = delta * 0.35
+    ax.bar(t_ax - w / 2, hl_theta * 100, width=w, color="steelblue",
+           alpha=0.7, label="Ho-Lee")
+    ax.bar(t_ax + w / 2, bdt_theta * 100, width=w, color="darkorange",
+           alpha=0.7, label="BDT")
+    ax.set_xlabel("Time (years)")
+    ax.set_ylabel("θ_i (×100)")
+    ax.set_title("Calibrated Drift Parameters")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # (c) & (d) Terminal node distributions
+    last = n_steps - 1
+    n = last
+    probs = np.array([comb(n, j, exact=True) for j in range(n + 1)]) / (2 ** n)
+
+    ax = axes[1, 0]
+    rates_hl = hl_tree[last] * 100
+    bw = max(0.2, (rates_hl[0] - rates_hl[-1]) / (3 * len(rates_hl)))
+    ax.bar(rates_hl, probs, width=bw, color="steelblue", alpha=0.7)
+    ax.axvline(x=0, color="red", ls="--", lw=0.8, label="r = 0")
+    ax.set_xlabel("Short Rate (%)")
+    ax.set_ylabel("Probability")
+    ax.set_title(f"Ho-Lee: Terminal Node Distribution at T = {maturities[-1]:.0f}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    rates_bdt = bdt_r_tree[last] * 100
+    bw = max(0.2, (rates_bdt[0] - rates_bdt[-1]) / (3 * len(rates_bdt)))
+    ax.bar(rates_bdt, probs, width=bw, color="darkorange", alpha=0.7)
+    ax.set_xlabel("Short Rate (%)")
+    ax.set_ylabel("Probability")
+    ax.set_title(f"BDT: Terminal Node Distribution at T = {maturities[-1]:.0f}")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    if save:
+        plt.savefig("fig_a1_calibration_overview.png", dpi=150, bbox_inches="tight")
+    plt.show()
+
+    # Overlay comparison
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(rates_hl, probs, "b-o", ms=3, label="Ho-Lee", alpha=0.8)
+    ax.plot(rates_bdt, probs, "r-s", ms=3, label="BDT", alpha=0.8)
+    ax.axvline(x=0, color="grey", ls="--", lw=0.8)
+    ax.set_xlabel("Short Rate at Terminal Node (%)")
+    ax.set_ylabel("Risk-Neutral Probability")
+    ax.set_title(f"Comparison of Terminal Node Distributions (T = {maturities[-1]:.0f} years)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    if save:
+        plt.savefig("fig_a2_distribution_comparison.png", dpi=150, bbox_inches="tight")
+    plt.show()
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  SECTION 6: RUN CALIBRATION & DISPLAY RESULTS                           ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+maturities, yields_cc, zcb_prices, r0, n_steps = process_inputs(
+    YIELDS_PERCENT, DELTA, COMPOUNDING
+)
+T = n_steps * DELTA
+
+hl_tree, hl_theta = calibrate_ho_lee(r0, zcb_prices, SIGMA_HL, DELTA, n_steps)
+bdt_r_tree, bdt_z_tree, bdt_theta = calibrate_bdt(
+    r0, zcb_prices, SIGMA_BDT, DELTA, n_steps
+)
+
+if __name__ == "__main__":
+
+    print("=" * 70)
+    print("  FM405 PART (a): INTEREST RATE TREE CALIBRATION")
+    print("=" * 70)
+    print(f"\n  Data source:   {DATA_SOURCE}")
+    print(f"  Data date:     {DATA_DATE}")
+    print(f"  Compounding:   {COMPOUNDING}")
+    print(f"  Delta:         {DELTA} years (semi-annual)")
+    print(f"  Steps:         {n_steps}")
+    print(f"  Maturity:      T = {T:.0f} years")
+    print(f"  Initial rate:  r0 = {r0 * 100:.4f}%")
+    print(f"  Ho-Lee sigma:  {SIGMA_HL * 100:.2f}% (level)")
+    print(f"  BDT sigma:     {SIGMA_BDT * 100:.2f}% (log-rate)")
+
+    print(f"\n  Input Yield Curve:")
+    print(f"  {'Maturity':>8}  {'Yield(%)':>10}  {'ZCB Price':>12}")
+    print(f"  {'-' * 34}")
+    for i in range(n_steps):
+        print(
+            f"  {maturities[i]:>8.1f}  {yields_cc[i] * 100:>10.4f}  "
+            f"{zcb_prices[i]:>12.4f}"
+        )
+
+    # --- Ho-Lee ---
+    print("\n" + "=" * 70)
+    print("  HO-LEE MODEL")
+    print("=" * 70)
+
+    print_tree_with_theta(hl_tree, hl_theta, "Ho-Lee Interest Rate Tree", DELTA)
+
+    print("\n  Verification (repricing ZCBs from Ho-Lee tree):")
+    verify_calibration(hl_tree, zcb_prices, DELTA, maturities, "Ho-Lee")
+
+    has_neg = any(np.any(hl_tree[i] < 0) for i in range(n_steps) if hl_tree[i] is not None)
+    if has_neg:
+        print("\n  Ho-Lee tree contains negative interest rates.")
+    else:
+        print("\n  All Ho-Lee rates are non-negative.")
+
+    # --- BDT ---
+    print("\n" + "=" * 70)
+    print("  BLACK-DERMAN-TOY (BDT) MODEL")
+    print("=" * 70)
+
+    print_tree_with_theta(bdt_r_tree, bdt_theta, "BDT Interest Rate Tree", DELTA)
+
+    print("\n  Verification (repricing ZCBs from BDT tree):")
+    verify_calibration(bdt_r_tree, zcb_prices, DELTA, maturities, "BDT")
+
+    print("\n  All BDT rates are positive by construction.")
+
+    # --- Summary comparison ---
+    print("\n" + "=" * 70)
+    print("  MODEL COMPARISON")
+    print("=" * 70)
+    last = n_steps - 1
+    print(f"\n  Rate range at T = {T:.0f} years:")
+    print(f"    Ho-Lee: [{hl_tree[last][-1] * 100:.2f}%, {hl_tree[last][0] * 100:.2f}%]")
+    print(f"    BDT:    [{bdt_r_tree[last][-1] * 100:.2f}%, {bdt_r_tree[last][0] * 100:.2f}%]")
+    print(f"\n  Key differences:")
+    print("    - Ho-Lee models the level of r; allows negative rates")
+    print("    - BDT models ln(r); rates always positive")
+    print("    - Both exactly fit the observed term structure")
+    print("    - Distributional differences matter for option-like payoffs")
+
+    # --- Plots ---
+    plot_all(
+        maturities, yields_cc, hl_tree, bdt_r_tree,
+        hl_theta, bdt_theta, DELTA, n_steps, save=SAVE_PLOTS
+    )
+
+    print("\n" + "=" * 70)
+    print("  PART (a) COMPLETE")
+    print("=" * 70)
